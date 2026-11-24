@@ -59,7 +59,10 @@ public class RenameVariableTask extends RenameTask {
 	@Override
 	public boolean isValid(String newNm) {
 		newName = newNm;
-		if (isSymbolInFunction(function, newName)) {
+		boolean nameAvailable = highSymbol.isParameter()
+				? !isSymbolInFunction(function, newName)
+				: HighFunctionDBUtil.isLocalVariableNameAvailable(hfunction, newName);
+		if (!nameAvailable) {
 			errorMsg = "Duplicate name";
 			return false;
 		}

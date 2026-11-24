@@ -308,6 +308,18 @@ public class HighFunctionDBUtil {
 		}
 	}
 
+	private static void clearObsoleteDynamicLocalFromDatabase(HighFunction highFunction,
+			String name) {
+		Function function = highFunction.getFunction();
+		Variable[] variables = function.getLocalVariables();
+		for (Variable var : variables) {
+			if (var.isUniqueVariable() && name.equals(var.getName()) &&
+				!isValidUniqueVariable(highFunction, var)) {
+				function.removeVariable(var);
+			}
+		}
+	}
+
 	private static boolean isValidUniqueVariable(HighFunction highFunction, Variable var) {
 		if (!var.isUniqueVariable()) {
 			return false;
@@ -328,6 +340,18 @@ public class HighFunctionDBUtil {
 			}
 		}
 		return false;
+	}
+
+	public static boolean isLocalVariableNameAvailable(HighFunction highFunction, String name) {
+		Function function = highFunction.getFunction();
+		for (Symbol symbol : function.getProgram().getSymbolTable().getSymbols(name, function)) {
+			Object object = symbol.getObject();
+			if (!(object instanceof Variable variable) || !variable.isUniqueVariable() ||
+				isValidUniqueVariable(highFunction, variable)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -599,6 +623,9 @@ public class HighFunctionDBUtil {
 			}
 		}
 		else if (!highSymbol.isGlobal()) {
+			if (name != null) {
+				clearObsoleteDynamicLocalFromDatabase(highFunction, name);
+			}
 			Variable[] varList = null;
 			highSymbol.resolveStorage();
 			VariableStorage storage = highSymbol.getStorage();

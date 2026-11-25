@@ -15,18 +15,13 @@
  */
 package ghidra.app.plugin.core.decompile.actions;
 
-import java.util.List;
-
 import docking.action.MenuData;
 import ghidra.app.decompiler.*;
 import ghidra.app.plugin.core.decompile.DecompilerActionContext;
-import ghidra.app.plugin.core.decompile.actions.ConvertConstantAction.NearMatchValues;
 import ghidra.app.util.HelpTopics;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.pcode.*;
-import ghidra.program.model.symbol.Equate;
-import ghidra.program.model.symbol.EquateTable;
 import ghidra.util.HelpLocation;
 import ghidra.util.Msg;
 import ghidra.util.exception.InvalidInputException;
@@ -72,32 +67,6 @@ public class RemoveEquateAction extends AbstractDecompilerAction {
 	}
 
 	/**
-	 * Remove a specific Equate reference on a constant
-	 * @param program is the Program
-	 * @param equate is the Equate being referenced
-	 * @param refAddr is the address of the reference
-	 * @param convertHash is a dynamic hash of the Varnode (or -1 if the equate is on an instruction)
-	 */
-	private void removeReference(Program program, Equate equate, Address refAddr,
-			long convertHash) {
-		int transaction = program.startTransaction("Remove Equate Reference");
-		boolean commit = false;
-		try {
-			if (equate.getReferenceCount() <= 1) {
-				program.getEquateTable().removeEquate(equate.getName());
-			}
-			else {
-				equate.removeReference(convertHash, refAddr);
-			}
-			commit = true;
-		}
-		finally {
-			program.endTransaction(transaction, commit);
-		}
-
-	}
-
-	/**
 	 * Remove the integer format override for a specific JumpTable
 	 * @param context is the selected context
 	 * @param opAddress is the address of the JumpTable branch site
@@ -134,25 +103,20 @@ public class RemoveEquateAction extends AbstractDecompilerAction {
 			return;
 		}
 		HighSymbol convertSymbol = convertVn.getHigh().getSymbol();
-		if (convertSymbol instanceof EquateSymbol) {
-			Address convertAddr = convertSymbol.getPCAddress();
-			SymbolEntry entry = convertSymbol.getFirstWholeMap();
-			if (!(entry instanceof DynamicEntry)) {
-				return;
-			}
-			long convertHash = ((DynamicEntry) entry).getHash();
+		if (convertSymbol instanceof EquateSymbol symbol) {
 			Program program = context.getProgram();
-			EquateTable equateTable = program.getEquateTable();
-			List<Equate> equates = equateTable.getEquates(convertAddr);
-			NearMatchValues values =
-				new NearMatchValues(convertVn.getOffset(), convertVn.getSize());
-			for (Equate equate : equates) {
-				if (values.isMatch(equate.getValue())) {
-					removeReference(program, equate, convertAddr, convertHash);
-					break;
-				}
+			int transaction = program.startTransaction("Remove Equate Reference");
+			boolean commit = false;
+			try {
+				commit = ConvertConstantEquateTask.removeExistingReference(program, symbol);
+			}
+			finally {
+				program.endTransaction(transaction, commit);
+			}
+			if (!commit) {
+				Msg.showError(this, null, "Remove Equate",
+					"Could not identify a unique equate reference.");
 			}
 		}
 	}
-
 }

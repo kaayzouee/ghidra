@@ -1131,6 +1131,9 @@ public class DecompilerProvider extends NavigatableComponentProviderAdapter
 		RemoveEquateAction removeEquateAction = new RemoveEquateAction();
 		setGroupInfo(removeEquateAction, convertGroup, subGroupPosition++);
 
+		ApplyEnumAction applyEnumAction = new ApplyEnumAction(plugin);
+		setGroupInfo(applyEnumAction, convertGroup, subGroupPosition++);
+
 		SetEquateAction setEquateAction = new SetEquateAction(plugin);
 		setGroupInfo(setEquateAction, convertGroup, subGroupPosition++);
 
@@ -1246,6 +1249,7 @@ public class DecompilerProvider extends NavigatableComponentProviderAdapter
 		addLocalAction(convertOctAction);
 		addLocalAction(convertCharAction);
 		addLocalAction(setEquateAction);
+		addLocalAction(applyEnumAction);
 		addLocalAction(removeEquateAction);
 		addLocalAction(retypeLocalAction);
 		addLocalAction(createRelativeAction);

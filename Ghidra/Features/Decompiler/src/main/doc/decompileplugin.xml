@@ -5391,6 +5391,17 @@
   </para>
 </sect2>
 
+<sect2 id="ActionApplyEnum">
+  <title>Apply Enum...</title>
+  <para>
+    Right-click an integer constant and choose an enum data type to display its matching member.
+    Ghidra tries to apply the name to a matching instruction operand. It can also label a constant
+    computed from multiple instructions. A member with the same numeric value can match across
+    widths. An opposite-signed interpretation of the same bits requires equal widths.
+    If an existing Listing equate supplies several decompiler constants, edit that equate in the Listing.
+  </para>
+</sect2>
+
 <sect2 id="ActionSetEquate">
   <title>Set Equate...</title>
   <para>

@@ -15,12 +15,14 @@
  */
 package ghidra.app.plugin.core.decompile.actions;
 
-import java.util.List;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
 
 import ghidra.app.decompiler.ClangToken;
 import ghidra.app.decompiler.ClangVariableToken;
 import ghidra.app.plugin.core.decompile.DecompilerActionContext;
 import ghidra.app.plugin.core.decompile.actions.ConvertConstantAction.NearMatchValues;
+import ghidra.program.database.symbol.EquateManager;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.block.CodeBlock;
 import ghidra.program.model.block.SimpleBlockModel;
@@ -55,9 +57,14 @@ public class ConvertConstantEquateTask implements Callback {
 	private final static int MAX_INSTRUCTION_WINDOW = 20;
 
 	private static final int MAX_SCALAR_SIZE = 8;
-	private DecompilerActionContext context;
-	private Program program;
-	private Scalar convertValue;		// Constant being converted
+	private record ExistingReference(Equate equate, EquateReference reference) {}
+	private record EnumMember(Enum type, long value) {}
+
+	private final DecompilerActionContext context;
+	private final Program program;
+	private ExistingReference previous;
+	private EnumMember enumMember;
+	private final Scalar convertValue;		// Constant being converted
 	private Address convertAddress;		// The primary address of the Equate
 	private String convertName;			// The primary name to use in the Equate table
 	private long convertHash;			// A dynamic hash locating the constant Varnode in data-flow
@@ -165,21 +172,34 @@ public class ConvertConstantEquateTask implements Callback {
 	}
 
 	/**
-	 * Remove any pre-existing equate reference with the same address and hash as the
-	 * primate equate.
+	 * Remove the existing primary reference and check for conflicting references.
 	 */
-	private void removePrimaryReference() {
+	private void removePrimaryReference() throws InvalidInputException {
+		long targetHash = convertHash;
+		if (previous != null) {
+			if (!removeReference(program, previous.equate(), previous.reference())) {
+				throw new InvalidInputException("Ambiguous equate reference");
+			}
+			if (targetHash == 0) {
+				// Adding a Listing reference stores a hash if the instruction yields exactly one.
+				Instruction instr = program.getListing().getInstructionAt(convertAddress);
+				if (instr != null) {
+					long value = enumMember == null ? convertValue.getValue() : enumMember.value();
+					long[] hashes = DynamicHash.calcConstantHash(instr, value);
+					targetHash = hashes.length == 1 ? hashes[0] : 0;
+				}
+			}
+		}
 		EquateTable equateTable = program.getEquateTable();
-		List<Equate> equates = equateTable.getEquates(convertAddress);
-		for (Equate equate : equates) {
-			List<EquateReference> references = equate.getReferences(convertAddress);
-			for (EquateReference ref : references) {
-				if (ref.getDynamicHashValue() == convertHash) {
-					if (equate.getReferenceCount() <= 1) {
-						equateTable.removeEquate(equate.getName());
+		for (Equate equate : equateTable.getEquates(convertAddress)) {
+			for (EquateReference ref : equate.getReferences(convertAddress)) {
+				if (ref.getDynamicHashValue() == targetHash &&
+					(targetHash != 0 || ref.getOpIndex() == convertIndex)) {
+					if (previous != null) {
+						throw new InvalidInputException("Another equate already uses this reference");
 					}
-					else {
-						equate.removeReference(convertHash, convertAddress);
+					if (!removeReference(program, equate, ref)) {
+						throw new InvalidInputException("Ambiguous equate reference");
 					}
 					return;
 				}
@@ -187,48 +207,50 @@ public class ConvertConstantEquateTask implements Callback {
 		}
 	}
 
+	private static boolean removeReference(Program program, Equate equate, EquateReference ref) {
+		if (equate.getReferenceCount() <= 1) {
+			program.getEquateTable().removeEquate(equate.getName());
+			return true;
+		}
+		long hash = ref.getDynamicHashValue();
+		if (hash != 0) {
+			equate.removeReference(hash, ref.getAddress());
+		}
+		else {
+			long count = equate.getReferences(ref.getAddress()).stream()
+					.filter(candidate -> candidate.getOpIndex() == ref.getOpIndex())
+					.count();
+			if (count != 1) {
+				return false;
+			}
+			equate.removeReference(ref.getAddress(), ref.getOpIndex());
+		}
+		return true;
+	}
+
 	/**
-	 * Remove and pre-existing equate reference with the same address and hash as the
-	 * alternate equate.
+	 * Remove the alternate reference installed by this task.
+	 * @return true if the reference was found and removed
 	 */
-	private void removeAlternateReference() {
-		EquateTable equateTable = program.getEquateTable();
-		List<Equate> equates = equateTable.getEquates(altAddress);
-		for (Equate equate : equates) {
-			List<EquateReference> references = equate.getReferences(altAddress);
-			for (EquateReference ref : references) {
+	private boolean removeAlternateReference() {
+		Equate equate = program.getEquateTable().getEquate(altName);
+		if (equate != null) {
+			for (EquateReference ref : equate.getReferences(altAddress)) {
 				if (ref.getOpIndex() == altIndex) {
-					if (equate.getReferenceCount() <= 1) {
-						equateTable.removeEquate(equate.getName());
-					}
-					else {
-						equate.removeReference(altAddress, altIndex);
-					}
-					return;
+					return removeReference(program, equate, ref);
 				}
 			}
 		}
+		return false;
 	}
 
 	/**
-	 * Add equate based on the alternate constant information: altAddress, altName, altIndex
+	 * Add the primary equate reference for the selected constant.
 	 * @throws DuplicateNameException if there is already an equate with same name but different value
-	 * @throws InvalidInputException if the equate name is illegal
+	 * @throws InvalidInputException if the equate cannot be created
 	 */
 	private void addPrimaryEquate() throws DuplicateNameException, InvalidInputException {
-		EquateTable equateTable = program.getEquateTable();
-		Equate equate = equateTable.getEquate(convertName);
-
-		if (equate != null && equate.getValue() != convertValue.getValue()) {
-			String msg = "Equate named " + convertName + " already exists with value of " +
-				equate.getValue() + ".";
-			throw new DuplicateNameException(msg);
-		}
-
-		if (equate == null) {
-			equate = equateTable.createEquate(convertName, convertValue.getValue());
-		}
-
+		Equate equate = getOrCreateEquate(convertName, convertValue.getValue());
 		// Add reference to existing equate
 		if (convertHash != 0) {
 			equate.addReference(convertHash, convertAddress);
@@ -239,25 +261,45 @@ public class ConvertConstantEquateTask implements Callback {
 	}
 
 	/**
-	 * Add equate based on the direct constant information: convertAddress, convertName, convertHash
+	 * Add the alternate equate reference at the matching instruction operand.
 	 * @throws DuplicateNameException if there is already an equate with same name but different value
-	 * @throws InvalidInputException if the equate name is illegal
+	 * @throws InvalidInputException if the equate cannot be created
 	 */
 	private void addAlternateEquate() throws InvalidInputException, DuplicateNameException {
-		EquateTable equateTable = program.getEquateTable();
-		Equate equate = equateTable.getEquate(altName);
+		Equate equate = getOrCreateEquate(altName, altValue);
+		equate.addReference(altAddress, altIndex);
+		altName = equate.getName();
+	}
 
-		if (equate != null && equate.getValue() != altValue) {
-			String msg = "Equate named " + altName + " already exists with value of " +
+	private Equate getOrCreateEquate(String name, long value)
+			throws InvalidInputException, DuplicateNameException {
+		if (enumMember != null) {
+			DataTypeManager manager = program.getDataTypeManager();
+			Enum chosen = enumMember.type();
+			DataType resolved = manager.findDataTypeForID(chosen.getUniversalID());
+			if (resolved == null) {
+				resolved = manager.resolve(chosen, null);
+			}
+			if (!(resolved instanceof Enum enoom) || !enoom.contains(enumMember.value())) {
+				throw new InvalidInputException("The program enum has no matching member");
+			}
+			value = enumMember.value();
+			name = EquateManager.formatNameForEquate(enoom.getUniversalID(), value);
+		}
+		EquateTable equateTable = program.getEquateTable();
+		Equate equate = equateTable.getEquate(name);
+
+		if (equate != null && equate.getValue() != value) {
+			String msg = "Equate named " + name + " already exists with value of " +
 				equate.getValue() + ".";
 			throw new DuplicateNameException(msg);
 		}
 
 		if (equate == null) {
-			equate = equateTable.createEquate(altName, altValue);
+			equate = equateTable.createEquate(name, value);
 		}
 
-		equate.addReference(altAddress, altIndex);
+		return equate;
 	}
 
 	/**
@@ -269,8 +311,8 @@ public class ConvertConstantEquateTask implements Callback {
 		int transaction = program.startTransaction("Convert constant");
 		boolean commit = false;
 		try {
-			if (altAddress != null) {
-				removeAlternateReference();
+			if (altAddress != null && !removeAlternateReference()) {
+				return;
 			}
 			removePrimaryReference();
 			addPrimaryEquate();
@@ -290,11 +332,19 @@ public class ConvertConstantEquateTask implements Callback {
 	/**
 	 * Create a reference to the alternate equate.
 	 */
-	private void applyAlternateEquate() {
+	private boolean applyAlternateEquate() {
 		int transaction = program.startTransaction("Convert constant");
 		boolean commit = false;
 		try {
-			addAlternateEquate();
+			EquateTable table = program.getEquateTable();
+			boolean occupied = enumMember != null ? !table.getEquates(altAddress).isEmpty()
+					: !table.getEquates(altAddress, altIndex).isEmpty();
+			if (occupied) {
+				altAddress = null;
+			}
+			else {
+				addAlternateEquate();
+			}
 			commit = true;
 		}
 		catch (DuplicateNameException e) {
@@ -306,6 +356,7 @@ public class ConvertConstantEquateTask implements Callback {
 		finally {
 			program.endTransaction(transaction, commit);
 		}
+		return commit;
 	}
 
 	/**
@@ -323,14 +374,15 @@ public class ConvertConstantEquateTask implements Callback {
 			return false;
 		}
 		HighSymbol symbol = vn.getHigh().getSymbol();	// But now it should have an equate on it
-		if (!(symbol instanceof EquateSymbol)) {
+		if (!(symbol instanceof EquateSymbol eqSymbol) || !altAddress.equals(eqSymbol.getPCAddress())) {
 			return false;
 		}
-		EquateSymbol eqSymbol = (EquateSymbol) symbol;
-		if (!eqSymbol.getPCAddress().equals(altAddress)) {
-			return false;
+		if (enumMember == null) {
+			return true;
 		}
-		return true;
+		Equate alternate = program.getEquateTable().getEquate(altName);
+		return alternate != null && eqSymbol.getValue() == enumMember.value() &&
+			alternate.getDisplayName().equals(eqSymbol.getName());
 	}
 
 	/**
@@ -353,8 +405,10 @@ public class ConvertConstantEquateTask implements Callback {
 	 * removed, and the task falls back and places the primary equate.
 	 */
 	public void runTask() {
+		if (altAddress != null && !applyAlternateEquate()) {
+			return;
+		}
 		if (altAddress != null) {
-			applyAlternateEquate();
 			try {
 				Thread.sleep(50);		// Let the decompiler get going
 			}
@@ -369,20 +423,23 @@ public class ConvertConstantEquateTask implements Callback {
 	}
 
 	/**
-	 * Find a scalar in the instruction matching one of the given values.
-	 * Return an object describing the match or null if there is no match.
+	 * Find an operand matching the enum member or one of the nearby scalar values.
 	 * @param instr is the instruction
-	 * @param values is set of given nearby values
-	 * @return the Scalar and
+	 * @param values is the set of nearby values to match
+	 * @param member is the enum member to match, or null to use nearby values
+	 * @return the match, with operand index -1 for multiple matches, or null for no match
 	 */
-	private static ScalarMatch findScalarInInstruction(Instruction instr, NearMatchValues values) {
+	private static ScalarMatch findScalarInInstruction(Instruction instr, NearMatchValues values,
+			EnumMember member) {
 		int numOperands = instr.getNumOperands();
 		ScalarMatch scalarMatch = null;
 		for (int i = 0; i < numOperands; i++) {
 			for (Object obj : instr.getOpObjects(i)) {
 				if (obj instanceof Scalar) {
 					Scalar scalar = (Scalar) obj;
-					if (values.isMatch(scalar.getValue())) {
+					boolean matches = member == null ? values.isMatch(scalar.getValue())
+							: scalar.getValue() == member.value() || scalar.getSignedValue() == member.value();
+					if (matches) {
 						if (scalarMatch != null) {
 							scalarMatch.opIndex = -1;	// non-unique scalar operand value - can't identify operand
 							return scalarMatch;
@@ -396,19 +453,17 @@ public class ConvertConstantEquateTask implements Callback {
 	}
 
 	/**
-	 * Find a scalar (instruction operand) that matches the given constant.
-	 * We walk backward from the starting address inspecting operands until a match is found.
-	 * The search is terminated if either a match is found, the beginning of the basic block
-	 * is reached, or if 20 instructions are traversed.  The scalar can be a "near" match, meaning
-	 * off by 1 or the negated value.
+	 * Search backward within the basic block for a unique matching scalar.
+	 * Enum members require a matching value. Other equates can match nearby values.
 	 * @param program is the Program
 	 * @param startAddress is the starting address to search backward from
 	 * @param scalar is the constant value to search for
+	 * @param member is the selected enum member, or null for another kind of equate
 	 * @return a description of the scalar match, or null if there is no match
 	 */
 	private static ScalarMatch findScalarMatch(Program program, Address startAddress,
-			Scalar scalar) {
-		NearMatchValues values = new NearMatchValues(scalar);
+			Scalar scalar, EnumMember member) {
+		NearMatchValues values = member == null ? new NearMatchValues(scalar) : null;
 		int count = 0;
 		ScalarMatch match = null;
 		Instruction curInst = program.getListing().getInstructionAt(startAddress);
@@ -430,7 +485,7 @@ public class ConvertConstantEquateTask implements Callback {
 
 		while (count < MAX_INSTRUCTION_WINDOW) {
 			count += 1;
-			ScalarMatch newMatch = findScalarInInstruction(curInst, values);
+			ScalarMatch newMatch = findScalarInInstruction(curInst, values, member);
 			if (newMatch != null) {
 				if (match != null) {
 					return null;		// Matches at more than one address
@@ -448,7 +503,7 @@ public class ConvertConstantEquateTask implements Callback {
 				break;
 			}
 		}
-		if (match != null) {
+		if (match != null && member == null) {
 			if (match.scalar.bitLength() < 8 || match.scalar.isSigned() != scalar.isSigned()) {
 				int size = match.scalar.bitLength();
 				if (size < 8)
@@ -459,44 +514,66 @@ public class ConvertConstantEquateTask implements Callback {
 		return match;
 	}
 
-	private static ConvertConstantEquateTask convertExistingSymbol(DecompilerActionContext context,
-			ConvertConstantAction action, EquateSymbol convertSymbol, Scalar scalar) {
-		Address convertAddr = convertSymbol.getPCAddress();
+	private static ExistingReference findExistingReference(Program program, EquateSymbol convertSymbol) {
 		SymbolEntry entry = convertSymbol.getFirstWholeMap();
-		long convertHash = 0;
-		if (entry instanceof DynamicEntry) {
-			convertHash = ((DynamicEntry) entry).getHash();
+		if (!(entry instanceof DynamicEntry dynamicEntry) || dynamicEntry.getHash() == 0) {
+			return null;
 		}
-		int convertIndex = -1;
-		boolean foundEquate = false;
-		Program program = context.getProgram();
-		EquateTable equateTable = program.getEquateTable();
-		List<Equate> equates = equateTable.getEquates(convertAddr);
-		NearMatchValues values = new NearMatchValues(scalar);
-		for (Equate equate : equates) {
-			if (!values.isMatch(equate.getValue()))
+		Address convertAddr = convertSymbol.getPCAddress();
+		long convertHash = dynamicEntry.getHash();
+		Instruction instr = program.getListing().getInstructionAt(convertAddr);
+		long value = convertSymbol.getValue();
+		Boolean reconstructedMatch = null;
+		ExistingReference selected = null;
+		for (Equate equate : new LinkedHashSet<>(program.getEquateTable().getEquates(convertAddr))) {
+			if (equate.getValue() != value) {
 				continue;
-			for (EquateReference equateRef : equate.getReferences(convertAddr)) {
-				if (convertHash != equateRef.getDynamicHashValue())
-					continue;
-				convertIndex = equateRef.getOpIndex();
-				foundEquate = true;
-				break;
 			}
-			if (foundEquate)
-				break;
+			String name = equate.getDisplayName();
+			int format = EquateSymbol.convertName(name, value);
+			if (format != convertSymbol.getConvert() ||
+				(format == EquateSymbol.FORMAT_DEFAULT && !name.equals(convertSymbol.getName()))) {
+				continue;
+			}
+			for (EquateReference ref : equate.getReferences(convertAddr)) {
+				long hash = ref.getDynamicHashValue();
+				if (hash == 0 && instr != null) {
+					if (reconstructedMatch == null) {
+						long[] hashes = DynamicHash.calcConstantHash(instr, value);
+						reconstructedMatch = Arrays.stream(hashes).anyMatch(h -> h == convertHash);
+						if (reconstructedMatch &&
+							!Arrays.stream(hashes).allMatch(h -> h == convertHash)) {
+							Msg.error(ConvertConstantEquateTask.class,
+								"Listing equate applies to multiple constants");
+							return null;
+						}
+					}
+					if (!reconstructedMatch) {
+						continue;
+					}
+				}
+				else if (hash != convertHash) {
+					continue;
+				}
+				if (selected != null) {
+					Msg.error(ConvertConstantEquateTask.class, "Ambiguous equate reference");
+					return null;
+				}
+				selected = new ExistingReference(equate, ref);
+			}
 		}
-		if (!foundEquate) {
-			Msg.error(action, "Symbol does not have matching entry in equate table");
-			return null;
+		if (selected == null) {
+			Msg.error(ConvertConstantEquateTask.class, "Unable to identify the equate reference");
 		}
+		return selected;
+	}
 
-		String equateName = action.getEquateName(scalar, context.getProgram());
-		if (equateName == null) {		// A null is a user cancel
-			return null;
+	static boolean removeExistingReference(Program program, EquateSymbol symbol) {
+		ExistingReference selected = findExistingReference(program, symbol);
+		if (selected == null) {
+			return false;
 		}
-		return new ConvertConstantEquateTask(context, equateName, convertAddr, scalar, convertHash,
-			convertIndex);
+		return removeReference(program, selected.equate(), selected.reference());
 	}
 
 	/**
@@ -509,43 +586,86 @@ public class ConvertConstantEquateTask implements Callback {
 	protected static ConvertConstantEquateTask establishTask(DecompilerActionContext context,
 			ConvertConstantAction action) {
 
-		Scalar scalar =
-			ConvertConstantEquateTask.getConvertibleConstant(context, action.convertType);
+		Scalar scalar = getConvertibleConstant(context, action.convertType);
+		ConvertConstantEquateTask task = prepareTask(context, scalar, action.convertType, null);
+		if (task == null) {
+			return null;
+		}
+		String name = action.getEquateName(task.convertValue, context.getProgram());
+		if (name == null) {
+			return null;
+		}
+		task.convertName = name;
+		if (task.altAddress != null) {
+			task.altName = name;
+		}
+		return task;
+	}
+
+	static ConvertConstantEquateTask forEnum(DecompilerActionContext context, Scalar scalar,
+			Enum enoom, long value) {
+		EnumMember member = new EnumMember(enoom, value);
+		ConvertConstantEquateTask task =
+			prepareTask(context, scalar, EquateSymbol.FORMAT_DEFAULT, member);
+		if (task == null) {
+			return null;
+		}
+		if (task.previous != null && task.previous.equate().getValue() != value) {
+			Varnode vn = context.getTokenAtCursor().getVarnode();
+			DynamicHash hash = new DynamicHash(vn, context.getHighFunction());
+			if (hash.getHash() == 0) {
+				return null;
+			}
+			task.convertHash = hash.getHash();
+			task.convertAddress = hash.getAddress();
+			task.convertIndex = -1;
+		}
+		task.enumMember = member;
+		return task;
+	}
+
+	private static ConvertConstantEquateTask prepareTask(DecompilerActionContext context,
+			Scalar scalar, int convertType, EnumMember member) {
 		Varnode varnode = context.getTokenAtCursor().getVarnode();
 		HighSymbol symbol = varnode.getHigh().getSymbol();
-		if (symbol instanceof EquateSymbol) {
-			return convertExistingSymbol(context, action, (EquateSymbol) symbol, scalar);
+		if (symbol instanceof EquateSymbol equateSymbol) {
+			ExistingReference selected = findExistingReference(context.getProgram(), equateSymbol);
+			if (selected == null) {
+				return null;
+			}
+			EquateReference ref = selected.reference();
+			ConvertConstantEquateTask task = new ConvertConstantEquateTask(context, null,
+				ref.getAddress(), scalar, ref.getDynamicHashValue(), ref.getOpIndex());
+			task.previous = selected;
+			return task;
 		}
 
 		PcodeOp op = varnode.getLoneDescend();
-		Address convertAddr = op.getSeqnum().getTarget();
-		DynamicHash dynamicHash = new DynamicHash(varnode, 0);
+		DynamicHash dynamicHash = member != null ? new DynamicHash(varnode, context.getHighFunction())
+				: new DynamicHash(varnode, 0);
 		long convertHash = dynamicHash.getHash();
+		if (convertHash == 0) {
+			return null;
+		}
+		Address convertAddr = dynamicHash.getAddress();
+		if (op == null) {
+			return new ConvertConstantEquateTask(context, null, convertAddr, scalar, convertHash, -1);
+		}
 		Program program = context.getProgram();
-		ScalarMatch match = findScalarMatch(program, convertAddr, scalar);
+		ScalarMatch match = findScalarMatch(program, op.getSeqnum().getTarget(), scalar, member);
 		// Don't create a named equate if the varnode and the instruction operand differ
 		// as the name was selected specifically for the varnode
-		if (match == null || (action.convertType == EquateSymbol.FORMAT_DEFAULT &&
+		if (match == null || (member == null && convertType == EquateSymbol.FORMAT_DEFAULT &&
 			match.scalar.getValue() != scalar.getValue())) {
-			String equateName = action.getEquateName(scalar, program);
-			if (equateName == null) {
-				return null; // A null is a user cancel
-			}
-			return new ConvertConstantEquateTask(context, equateName, convertAddr, scalar,
-				convertHash, -1);
-		}
-
-		String equateName = action.getEquateName(match.scalar, program);
-		if (equateName == null) {
-			return null; // user cancelled
+			return new ConvertConstantEquateTask(context, null, convertAddr, scalar, convertHash, -1);
 		}
 
 		ConvertConstantEquateTask task =
-			new ConvertConstantEquateTask(context, equateName, convertAddr, match.scalar,
-				convertHash, -1);
+			new ConvertConstantEquateTask(context, null, convertAddr, match.scalar, convertHash, -1);
 
 		// Try to set the equate on the instruction
-		task.setAlternate(equateName, match.refAddr, match.opIndex, match.scalar.getValue());
+		task.setAlternate(null, match.refAddr, match.opIndex,
+			member == null ? match.scalar.getValue() : member.value());
 		return task;
 	}
 }
